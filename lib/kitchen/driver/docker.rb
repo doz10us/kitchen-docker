@@ -147,6 +147,16 @@ module Kitchen
         URI.parse(config[:socket])
       end
 
+      def docker_command_sworm(cmd, options={})
+        nodes = docker_command("node ls --format '{{ .Hostname }}'")
+        socket = config[:socket]
+        nodes.each_line { |node|
+          config[:socket] = node.chomp
+          docker_command(cmd, options)
+        }
+        config[:socket] = socket
+      end
+
       def docker_command(cmd, options={})
         docker = config[:binary].dup
         docker << " -H #{config[:socket]}" if config[:socket]
@@ -313,8 +323,15 @@ module Kitchen
         file = Tempfile.new('Dockerfile-kitchen', Dir.pwd)
         output = begin
           file.write(dockerfile)
+          123
           file.close
-          docker_command("#{cmd} -f #{Shellwords.escape(dockerfile_path(file))} #{build_context}", :input => dockerfile_contents)
+          cmd << " -f #{Shellwords.escape(dockerfile_path(file))} -t #{config[:instance_name]}:latest #{build_context}"
+          options = { :input => dockerfile_contents }
+          if config[:use_swarm]
+            docker_command_sworm(cmd, options)
+          else
+            docker_command(cmd, options)
+          end
         ensure
           file.close unless file.closed?
           file.unlink
@@ -332,29 +349,45 @@ module Kitchen
       end
 
       def build_run_command(image_id)
-        cmd = "run -d -p 22"
-        Array(config[:forward]).each {|port| cmd << " -p #{port}"}
-        Array(config[:dns]).each {|dns| cmd << " --dns #{dns}"}
-        Array(config[:add_host]).each {|host, ip| cmd << " --add-host=#{host}:#{ip}"}
-        Array(config[:volume]).each {|volume| cmd << " -v #{volume}"}
-        Array(config[:volumes_from]).each {|container| cmd << " --volumes-from #{container}"}
-        Array(config[:links]).each {|link| cmd << " --link #{link}"}
-        Array(config[:devices]).each {|device| cmd << " --device #{device}"}
-        cmd << " --name #{config[:instance_name]}" if config[:instance_name]
-        cmd << " -P" if config[:publish_all]
-        cmd << " -h #{config[:hostname]}" if config[:hostname]
-        cmd << " -m #{config[:memory]}" if config[:memory]
-        cmd << " -c #{config[:cpu]}" if config[:cpu]
-        cmd << " -e http_proxy=#{config[:http_proxy]}" if config[:http_proxy]
-        cmd << " -e https_proxy=#{config[:https_proxy]}" if config[:https_proxy]
-        cmd << " --privileged" if config[:privileged]
-        Array(config[:cap_add]).each {|cap| cmd << " --cap-add=#{cap}"} if config[:cap_add]
-        Array(config[:cap_drop]).each {|cap| cmd << " --cap-drop=#{cap}"} if config[:cap_drop]
-        Array(config[:security_opt]).each {|opt| cmd << " --security-opt=#{opt}"} if config[:security_opt]
+
+        swarm = config[:use_swarm] != nil
+        args = swarm ? ["service create"] : ["run -d"]
+        (["33339:22"] + Array(config[:forward])).each { |port| args.push("-p #{port}") }
+        Array(config[:dns]).each { |dns| args.push("--dns #{dns}") }
+
+        Array(config[:add_host]).each { |host, ip|
+          args.push("#{swarm ? "--host" : "--add-host"} #{host}:#{ip}")
+        }
+        Array(config[:volume]).each { |volume|
+          args.push(swarm ? "--mount type=bind,source=#{volume},destination=#{volume}" : "-v #{volume}")
+        }
+
+        unless swarm
+          Array(config[:volumes_from]).each { |container| args.push("--volumes-from #{container}") }
+          Array(config[:devices]).each { |device| args.push("--device #{device}") }
+          Array(config[:links]).each { |link| args.push("--link #{link}") }
+          args.push("--privileged") if config[:privileged]
+          args.push("-c #{config[:cpu]}") if config[:cpu]
+          args.push("-P") if config[:publish_all]
+          Array(config[:cap_add]).each { |cap| args.push("--cap-add=#{cap}") }
+          Array(config[:cap_drop]).each { |cap| args.push("--cap-drop=#{cap}") }
+          Array(config[:security_opt]).each {|opt| cargs.push("--security-opt=#{opt}") }
+        end
+
+        args.push("--name #{config[:instance_name]}") if config[:instance_name]
+        args.push("--hostname #{config[:hostname]}") if config[:hostname]
+        args.push("-e http_proxy=#{config[:http_proxy]}") if config[:http_proxy]
+        args.push("-e https_proxy=#{config[:https_proxy]}") if config[:https_proxy]
+
+        args.push("#{swarm ? "--limit-memory" : "--memory"} #{config[:memory]}") if config[:memory]
+        args.push("#{swarm ? "--limit-cpu" : "--cpus"} #{config[:cpus]}") if config[:cpus]
+
         extra_run_options = config_to_options(config[:run_options])
-        cmd << " #{extra_run_options}" unless extra_run_options.empty?
-        cmd << " #{image_id} #{config[:run_command]}"
-        cmd
+        args.push(extra_run_options) unless extra_run_options.empty?
+        args.push("#{swarm ? config[:instance_name] : image_id} #{config[:run_command]}")
+
+        puts args.join(" ")
+        args.join(" ")
       end
 
       def run_container(state)
